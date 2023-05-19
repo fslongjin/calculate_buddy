@@ -1,6 +1,9 @@
+#![feature(core_intrinsics)]
 use std::{
-    cmp,
+    cmp::{self, max, min},
+    f32::MIN,
     fs::OpenOptions,
+    intrinsics::{likely, unlikely},
     io::Write,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -13,19 +16,27 @@ const MAX_ORDER: usize = 31;
 const MIN_ORDER: usize = 12;
 
 // 一个全局变量MAX_PAGES，用来表示buddy算法最多能够管理的页数
-// const MAX_PAGES: usize = (1<<30);
+// const MAX_PAGES: usize = (2048);
 const MAX_PAGES: usize = (1 << 48) / (1 << 12);
 
 static CURRENT_PAGE: AtomicUsize = AtomicUsize::new(0);
 
 // == 计算buddy所需要预分配的页数的代码 BEGIN ==
 
+#[derive(Debug, Clone)]
+enum CalculateError {
+    PagesError(String),
+    EntriesError(String),
+    NoEnoughPages(String),
+}
+
 struct BuddyPageCalculator {
     layers: [BuddyCalculatorLayer; MAX_ORDER - MIN_ORDER],
     /// 总的页数
-    total: usize,
+    total_pages: usize,
     /// 每个页能够存放的buddy entry的数量
     entries_per_page: usize,
+    max_order: usize,
 }
 
 macro_rules! calculator_layer {
@@ -42,168 +53,188 @@ impl BuddyPageCalculator {
     const fn new(entries_per_page: usize) -> Self {
         BuddyPageCalculator {
             layers: [BuddyCalculatorLayer::new(); MAX_ORDER - MIN_ORDER],
-            total: 0,
+            total_pages: 0,
             entries_per_page,
+            max_order: 0,
         }
     }
 
-    fn calculate(&mut self, total_pages: usize) -> Vec<BuddyCalculatorResult> {
-        self.total = total_pages;
-        self.init();
+    fn calculate(&mut self, pages: usize) -> Result<Vec<BuddyCalculatorResult>, CalculateError> {
+        self.total_pages = pages;
+        self.init_layers();
 
-        // 自上而下计算每一层需要的页数
-        for start_order in (MIN_ORDER + 1..MAX_ORDER).rev() {
-            self.calculate_layer(start_order);
+        self.sim()?;
+
+        let mut res = Vec::new();
+        for order in MIN_ORDER..MAX_ORDER {
+            let layer = &calculator_layer!(self, order);
+            res.push(BuddyCalculatorResult::new(
+                order,
+                layer.allocated_pages,
+                layer.entries,
+            ));
         }
+        // print_results(&res);
 
-        let mut result: Vec<BuddyCalculatorResult> = Vec::new();
-
-        for i in MIN_ORDER..MAX_ORDER {
-            let l = &self.layers[i - MIN_ORDER];
-            let ent = l.entries;
-            let pages = (ent + self.entries_per_page - 1) / self.entries_per_page;
-            result.push(BuddyCalculatorResult::new(i, pages, ent));
-        }
-
-        return result;
+        return Ok(res);
     }
 
-    fn calculate_layer(&mut self, start_order: usize) {
-        {
-            let need_pages = calculator_layer!(self, start_order).need_pages();
-            let got = calculator_layer!(self, MIN_ORDER).get_entries(need_pages);
+    fn sim(&mut self) -> Result<(), CalculateError> {
+        loop {
+            let mut flag = false;
+            'outer: for order in (MIN_ORDER..MAX_ORDER).rev() {
+                let mut to_alloc =
+                    self.pages_need_to_alloc(order, calculator_layer!(self, order).entries);
+                // 模拟申请
+                while to_alloc > 0 {
+                    let page4k = calculator_layer!(self, MIN_ORDER).entries;
+                    let page4k = min(page4k, to_alloc);
+                    calculator_layer!(self, order).allocated_pages += page4k;
+                    calculator_layer!(self, MIN_ORDER).entries -= page4k;
+                    to_alloc -= page4k;
 
-            calculator_layer!(self, start_order).give_pages(got);
-        }
+                    if to_alloc == 0 {
+                        break;
+                    }
 
-        if calculator_layer!(self, start_order).need_pages() == 0 {
-            return;
-        }
-        while calculator_layer!(self, start_order).need_pages() != 0 {
-            // 4K entry不够，逐层向上找
-            let mut ord: Option<usize> = None;
-            for order in MIN_ORDER..(start_order + 1) {
-                if calculator_layer!(self, order).free_entries() == 0 {
-                    continue;
+                    // 从最小的order开始找，然后分裂
+                    let split_order = ((MIN_ORDER + 1)..=order).find(|&i| {
+                        let layer = &calculator_layer!(self, i);
+                        // println!("find: order: {}, entries: {}", i, layer.entries);
+                        layer.entries > 0
+                    });
+
+                    if let Some(split_order) = split_order {
+                        for i in (MIN_ORDER + 1..=split_order).rev() {
+                            let layer = &mut calculator_layer!(self, i);
+                            layer.entries -= 1;
+                            calculator_layer!(self, i - 1).entries += 2;
+                        }
+                    } else {
+                        // 从大的开始分裂
+                        let split_order = ((order + 1)..MAX_ORDER).find(|&i| {
+                            let layer = &calculator_layer!(self, i);
+                            // println!("find: order: {}, entries: {}", i, layer.entries);
+                            layer.entries > 0
+                        });
+                        if let Some(split_order) = split_order {
+                            for i in (order + 1..=split_order).rev() {
+                                let layer = &mut calculator_layer!(self, i);
+                                layer.entries -= 1;
+                                calculator_layer!(self, i - 1).entries += 2;
+                            }
+                            flag = true;
+                            break 'outer;
+                        } else {
+                            if order == MIN_ORDER
+                                && to_alloc == 1
+                                && calculator_layer!(self, MIN_ORDER).entries > 0
+                            {
+                                calculator_layer!(self, MIN_ORDER).entries -= 1;
+                                calculator_layer!(self, MIN_ORDER).allocated_pages += 1;
+                                break;
+                            } else {
+                                return Err(CalculateError::NoEnoughPages(format!(
+                                    "order: {}, pages_needed: {}",
+                                    order, to_alloc
+                                )));
+                            }
+                        }
+                    }
                 }
-                ord = Some(order);
+            }
+
+            if !flag {
                 break;
             }
+        }
+        return Ok(());
+    }
 
-            assert!(ord.is_some());
+    fn init_layers(&mut self) {
+        let max_order = min(log2(self.total_pages * Self::PAGE_4K), MAX_ORDER - 1);
 
-            let order = ord.unwrap();
-            // 逐层向下分裂
-            for i in (MIN_ORDER + 1..order + 1).rev() {
-                calculator_layer!(self, i).split();
-                calculator_layer!(self, i - 1).add_entries(2);
+        self.max_order = max_order;
+        let mut remain_bytes = self.total_pages * Self::PAGE_4K;
+        for order in (MIN_ORDER..=max_order).rev() {
+            let entries = remain_bytes / (1 << order);
+            remain_bytes -= entries * (1 << order);
+            calculator_layer!(self, order).entries = entries;
+            // println!(
+            //     "order: {}, entries: {}, pages: {}",
+            //     order,
+            //     entries,
+            //     calculator_layer!(self, order).allocated_pages
+            // );
+        }
+    }
+
+    fn entries_to_page(&self, entries: usize) -> usize {
+        (entries + self.entries_per_page - 1) / self.entries_per_page
+    }
+
+    fn pages_needed(&self, entries: usize) -> usize {
+        max(1, self.entries_to_page(entries))
+    }
+    fn pages_need_to_alloc(&self, order: usize, current_entries: usize) -> usize {
+        let allocated = calculator_layer!(self, order).allocated_pages;
+        let tot_need = self.pages_needed(current_entries);
+        if tot_need > allocated {
+            tot_need - allocated
+        } else {
+            0
+        }
+    }
+    fn check_result(&self, results: &Vec<BuddyCalculatorResult>) -> Result<(), CalculateError> {
+        // 检查pages是否正确
+        let mut total_pages = 0;
+        for r in results.iter() {
+            total_pages += r.pages;
+            total_pages += r.entries * (1 << r.order) / Self::PAGE_4K;
+        }
+        if unlikely(total_pages != self.total_pages) {
+            // println!("total_pages: {}, self.total_pages: {}", total_pages, self.total_pages);
+            return Err(CalculateError::PagesError(format!(
+                "total_pages: {}, self.total_pages: {}",
+                total_pages, self.total_pages
+            )));
+        }
+        // 在确认pages正确的情况下，检查每个链表的entries是否正确
+        // 检查entries是否正确
+        for r in results.iter() {
+            let pages_needed = self.pages_needed(r.entries);
+            if pages_needed != r.pages {
+                if likely(
+                    r.order == (MAX_ORDER - 1)
+                        && (pages_needed as isize - r.pages as isize).abs() == 1,
+                ) {
+                    continue;
+                }
+                return Err(CalculateError::EntriesError(format!(
+                    "order: {}, pages_needed: {}, pages: {}",
+                    r.order,
+                    self.pages_needed(r.entries),
+                    r.pages
+                )));
             }
-            // 把最底层的4K entry分配出去
-            let need_pages = calculator_layer!(self, start_order).need_pages();
-            let got = calculator_layer!(self, MIN_ORDER).get_entries(need_pages);
-            calculator_layer!(self, start_order).give_pages(got);
         }
-    }
-
-    fn init(&mut self) {
-        for i in (MIN_ORDER..MAX_ORDER).rev() {
-            calculator_layer!(self, i).init_layer(self.entries_per_page);
-        }
-
-        self.init_max_layer();
-    }
-
-    fn init_max_layer(&mut self) {
-        let l: &mut BuddyCalculatorLayer = &mut calculator_layer!(self, MAX_ORDER - 1);
-        let ent = (self.total * Self::PAGE_4K) / Self::MAX_ORDER_SIZE;
-        // println!(
-        //     "total:{}, max_order_size:{}, ent:{ent}",
-        //     self.total,
-        //     Self::MAX_ORDER_SIZE
-        // );
-        l.add_entries(ent);
+        return Ok(());
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct BuddyCalculatorLayer {
-    /// 该层请求分配的页数（还没分配）
-    need_pages: usize,
-    /// 每个页能够存放的buddy entry的数量
-    entries_per_page: usize,
     /// 当前层的buddy entry的数量
     entries: usize,
-    /// 当前层剩余的插槽的数量
-    slots_remain: usize,
+    allocated_pages: usize,
 }
 
 impl BuddyCalculatorLayer {
     const fn new() -> Self {
         BuddyCalculatorLayer {
-            need_pages: 0,
-            entries_per_page: 0,
             entries: 0,
-            slots_remain: 0,
+            allocated_pages: 0,
         }
-    }
-
-    fn init_layer(&mut self, entries_per_page: usize) {
-        self.entries_per_page = entries_per_page;
-        self.need_pages = 0;
-        self.entries = 0;
-        self.slots_remain = 0;
-    }
-
-    fn add_entries(&mut self, mut entries: usize) {
-        self.entries += entries;
-        if self.slots_remain >= entries {
-            self.slots_remain -= entries;
-            return;
-        }
-        entries -= self.slots_remain;
-        self.slots_remain = 0;
-
-        let add_pages = (entries + self.entries_per_page - 1) / self.entries_per_page;
-        self.need_pages += add_pages;
-        self.slots_remain += self.entries_per_page * add_pages;
-    }
-
-    fn give_pages(&mut self, pages: usize) {
-        // println!("self.need_pages: {}, pages: {}", self.need_pages, pages);
-        assert!(self.need_pages >= pages);
-        self.need_pages -= pages;
-    }
-
-    fn need_pages(&self) -> usize {
-        self.need_pages
-    }
-
-    fn free_entries(&self) -> usize {
-        self.entries
-    }
-
-    fn get_entries(&mut self, entries: usize) -> usize {
-        let entries = cmp::min(entries, self.entries);
-        self.entries -= entries;
-        self.slots_remain += entries;
-
-        self.reduce_page();
-        return entries;
-    }
-
-    fn reduce_page(&mut self) {
-        if self.slots_remain >= self.entries_per_page {
-            let to_reduce = self.slots_remain / self.entries_per_page;
-            self.need_pages -= to_reduce;
-            self.slots_remain -= self.entries_per_page * to_reduce;
-        }
-    }
-
-    fn split(&mut self) {
-        assert!(self.entries > 0);
-        self.entries -= 1;
-        self.slots_remain += 1;
-        self.reduce_page();
     }
 }
 
@@ -224,7 +255,7 @@ impl BuddyCalculatorResult {
     }
 }
 
-fn print_results(results: Vec<BuddyCalculatorResult>) {
+fn print_results(results: &Vec<BuddyCalculatorResult>) {
     let mut total_pages = 0;
     for r in results {
         println!(
@@ -264,26 +295,30 @@ fn task_generator() -> Option<Task> {
     return Some(Task::new(page, PAGE_NUM));
 }
 
-fn check_ok(results: &Vec<BuddyCalculatorResult>) -> bool {
-    let mut flag = false;
-    for r in results.iter().rev() {
-        if flag == false {
-            if r.entries == 0 {
-                continue;
-            }
-            flag = true;
-
-            continue;
-        }
-
-        if r.pages > 1 {
-            return false;
-        }
-    }
-
-    return true;
+#[derive(Debug)]
+struct ExceptionValue {
+    page: usize,
+    reason: String,
 }
-fn worker() -> Vec<usize> {
+
+impl PartialEq for ExceptionValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.page == other.page
+    }
+}
+impl PartialOrd for ExceptionValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.page.cmp(&other.page))
+    }
+}
+impl Eq for ExceptionValue {}
+impl Ord for ExceptionValue {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.page.cmp(&other.page)
+    }
+}
+
+fn worker(entries_per_page: usize) -> Vec<ExceptionValue> {
     let mut exception_value = Vec::new();
     loop {
         let task: Option<Task> = task_generator();
@@ -295,10 +330,20 @@ fn worker() -> Vec<usize> {
 
         for i in task.start_page..task.start_page + task.num_pages {
             let page = task.start_page + i;
-            let mut calculator = BuddyPageCalculator::new(255);
+            let mut calculator = BuddyPageCalculator::new(entries_per_page);
             let r = calculator.calculate(page);
-            if check_ok(&r) == false {
-                exception_value.push(i);
+            if r.is_err() {
+                exception_value.push(ExceptionValue {
+                    page,
+                    reason: format!("{:?}", r.unwrap_err()),
+                });
+                continue;
+            }
+            if let Err(e) = calculator.check_result(&r.unwrap()) {
+                exception_value.push(ExceptionValue {
+                    page,
+                    reason: format!("check_result error:{:?}", e),
+                });
             }
         }
     }
@@ -328,14 +373,13 @@ fn simu_show_progress() {
     pb.finish();
 }
 
-fn simulate() {
-
+fn simulate(entries_per_page: usize) {
     // 获取cpu核心数
     let cpus = num_cpus::get();
 
     let mut handles = Vec::new();
     for _ in 0..cpus {
-        let handle = std::thread::spawn(move || worker());
+        let handle = std::thread::spawn(move || worker(entries_per_page));
         handles.push(handle);
     }
 
@@ -356,22 +400,51 @@ fn simulate() {
         .create(true)
         .write(true)
         .truncate(true)
-        .open("exception_value.txt")
+        .open(format!("exception_value_{}.txt", entries_per_page))
         .unwrap();
     for v in exception_value {
-        file.write_all(format!("{}\n", v).as_bytes()).unwrap();
+        file.write_all(format!("{:?}\n", v).as_bytes()).unwrap();
     }
     println!("Simulate finished!");
 }
 
-fn main() {
-    // 单次计算
-    // let total_memory = 1 << 52;
-    // let total_pages = total_memory / BuddyPageCalculator::PAGE_4K;
-    // let mut calculator = BuddyPageCalculator::new(255);
-    // let r = calculator.calculate(total_pages);
-    // print_results(r);
+fn check_page_num(results: &Vec<BuddyCalculatorResult>, total_pages: usize) -> bool {
+    let idx = |order: usize| -> usize { order - MIN_ORDER };
+    let mut cnt_pages = 0;
+    for i in MIN_ORDER..MAX_ORDER {
+        let r = &results[idx(i)];
+        cnt_pages += r.pages;
+        cnt_pages += r.entries * (1 << idx(i));
+    }
+    println!("cnt_pages: {}, total_pages: {}", cnt_pages, total_pages);
+    if (cnt_pages as i64 - total_pages as i64).abs() > 1 {
+        return false;
+    }
+    return true;
+}
 
-    // 枚举所有的内存大小
-    simulate();
+fn log2(x: usize) -> usize {
+    let leading_zeros = x.leading_zeros() as usize;
+    let log2x = 63 - leading_zeros;
+    return log2x;
+}
+fn main() {
+    // 读取参数
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 2 {
+        println!("Usage: {} <entries_per_page>", args[0]);
+        return;
+    }
+    let entries_per_page: usize = args[1].parse().unwrap();
+    // 单次计算
+    // let total_memory = (19) * 4096;
+    // let total_pages = total_memory / BuddyPageCalculator::PAGE_4K;
+    // let total_pages = 67108864;
+    // let mut calculator = BuddyPageCalculator::new(entries_per_page);
+    // let r = calculator.calculate(total_pages);
+    // print_results(&r.as_ref().unwrap());
+    // calculator.check_result(&r.as_ref().unwrap()).unwrap();
+
+    // 枚举所有的内存大小,由于最小需要19个页,因此小于19个页的错误都不用管
+    simulate(entries_per_page);
 }
